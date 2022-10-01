@@ -1,0 +1,12 @@
+type Mutation {
+	createUser(email: String): String
+}
+
+type Query {
+	listUsers: [String!]!
+}
+
+schema {
+	query: Query
+	mutation: Mutation
+}
