@@ -35,6 +35,7 @@ data "aws_iam_policy_document" "appsync" {
   statement {
     actions = [
       "cognito-idp:AdminCreateUser",
+      "cognito-idp:AdminDeleteUser",
     ]
     resources = [
 			aws_cognito_user_pool.pool.arn
@@ -47,6 +48,14 @@ data "aws_iam_policy_document" "appsync" {
     ]
     resources = [
       aws_dynamodb_table.user.arn,
+    ]
+  }
+  statement {
+    actions = [
+      "dynamodb:PutItem",
+    ]
+    resources = [
+      aws_dynamodb_table.username.arn,
     ]
   }
 }
@@ -82,6 +91,16 @@ resource "aws_dynamodb_table" "user" {
   }
 }
 
+resource "aws_dynamodb_table" "username" {
+  name         = "username-${random_id.id.hex}"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "username"
+
+  attribute {
+    name = "username"
+    type = "S"
+  }
+}
 
 resource "aws_cognito_user_pool" "pool" {
   name = "test-${random_id.id.hex}"
@@ -123,6 +142,7 @@ resource "aws_appsync_function" "Mutation_createUser_1" {
 	name = "func1"
   data_source = aws_appsync_datasource.cognito.name
 	request_mapping_template = <<EOF
+$util.qr($ctx.stash.put("username", "$util.autoId()"))
 {
 	"version": "2018-05-29",
 	"method": "POST",
@@ -132,13 +152,14 @@ resource "aws_appsync_function" "Mutation_createUser_1" {
 			"X-Amz-Target": "AWSCognitoIdentityProviderService.AdminCreateUser"
 		},
 		"body":$util.toJson({
+			"MessageAction": "SUPPRESS",
 			"UserAttributes": [
 				{
 					"Name": "email",
 					"Value": $ctx.args.email
 				}
 			],
-			"Username": "$util.autoId()",
+			"Username": $ctx.stash.username,
 			"UserPoolId": "${aws_cognito_user_pool.pool.id}"
 		})
 	},
@@ -163,18 +184,77 @@ resource "aws_appsync_function" "Mutation_createUser_2" {
   data_source       = aws_appsync_datasource.ddb_users.name
   request_mapping_template  = <<EOF
 {
-	"version" : "2018-05-29",
-	"operation" : "PutItem",
-	"key" : {
-		"id" : {"S": $util.toJson($ctx.prev.result)}
-	}
+	"version": "2018-05-29",
+	"operation": "TransactWriteItems",
+	"transactItems": [
+		{
+			"table": "${aws_dynamodb_table.user.name}",
+			"operation": "PutItem",
+			"key": {
+				"id" : {"S": $util.toJson($ctx.prev.result)}
+			},
+			"attributeValues": {
+				"name": {"S": $util.toJson($ctx.args.name)},
+			}
+		},
+		{
+			"table": "${aws_dynamodb_table.username.name}",
+			"operation": "PutItem",
+			"key":{
+				"username": {"S": $util.toJson($ctx.args.name)}
+			},
+			"condition":{
+				"expression": "attribute_not_exists(#pk)",
+				"expressionNames": {
+					"#pk": "username"
+				}
+			}
+		}
+	]
 }
 EOF
   response_mapping_template = <<EOF
 #if($ctx.error)
+	$util.appendError($ctx.error.message, $ctx.error.type)
+#end
+$util.toJson($ctx.result.keys[0].id)
+EOF
+}
+
+resource "aws_appsync_function" "Mutation_createUser_3" {
+  api_id      = aws_appsync_graphql_api.appsync.id
+	name = "func3"
+  data_source = aws_appsync_datasource.cognito.name
+	request_mapping_template = <<EOF
+#if($ctx.outErrors.size() > 0)
+{
+	"version": "2018-05-29",
+	"method": "POST",
+	"params": {
+		"headers": {
+			"Content-Type": "application/x-amz-json-1.1",
+			"X-Amz-Target": "AWSCognitoIdentityProviderService.AdminDeleteUser"
+		},
+		"body":$util.toJson({
+			"Username": $ctx.stash.username,
+			"UserPoolId": "${aws_cognito_user_pool.pool.id}"
+		})
+	},
+	"resourcePath": "/"
+}
+#else
+	#return($ctx.prev.result)
+#end
+EOF
+
+	response_mapping_template = <<EOF
+#if ($ctx.error)
 	$util.error($ctx.error.message, $ctx.error.type)
 #end
-$util.toJson($ctx.result)
+#if ($ctx.result.statusCode < 200 || $ctx.result.statusCode >= 300)
+	$util.error($ctx.result.body, "StatusCode$ctx.result.statusCode")
+#end
+$util.toJson($ctx.prev.result)
 EOF
 }
 
@@ -189,6 +269,7 @@ resource "aws_appsync_resolver" "Mutation_createUser" {
     functions = [
       aws_appsync_function.Mutation_createUser_1.function_id,
       aws_appsync_function.Mutation_createUser_2.function_id,
+      aws_appsync_function.Mutation_createUser_3.function_id,
     ]
   }
 }
